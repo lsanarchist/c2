@@ -2,3 +2,5 @@
 AGENT.md
 FEATURE.md
 change.log
+*.csv
+scripts/
