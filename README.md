@@ -45,6 +45,15 @@ go build -o c2-agent  ./cmd/agent
 | GET    | /results    | List all stored results                          |
 | POST   | /command    | Queue a command for an agent (query params below)|
 
+### Agent list response
+
+`GET /agents` returns public agent metadata only:
+
+- `id`, `hostname`, `os`, `arch`, `last_seen`
+- `has_pending` (boolean flag showing whether a command is queued)
+
+Pending command text is intentionally not returned by this endpoint.
+
 ### Queue a command
 
 ```

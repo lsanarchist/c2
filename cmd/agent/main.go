@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/lsanarchist/c2/internal/agent"
@@ -25,6 +29,15 @@ func main() {
 		agentID = fmt.Sprintf("agent-%s", hostname)
 	}
 
-	a := agent.New(agentID, hostname, *serverURL, *interval)
-	a.Run()
+	a, err := agent.New(agentID, hostname, *serverURL, *interval)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := a.Run(ctx); err != nil {
+		log.Fatal(err)
+	}
 }

