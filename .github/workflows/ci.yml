@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build-test-vet:
     name: build-test-vet (${{ matrix.os }})
