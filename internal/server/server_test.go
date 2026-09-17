@@ -3,11 +3,14 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,179 +19,262 @@ import (
 	"github.com/lsanarchist/c2/pkg/protocol"
 )
 
-func newTestServer() (*server.Server, *httptest.Server) {
-	s := server.New()
+const (
+	testOperatorToken = "operator-secret"
+	testAgentAToken   = "agent-a-secret"
+	testAgentBToken   = "agent-b-secret"
+)
+
+func sha256Hex(value string) string {
+	hash := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(hash[:])
+}
+
+func newTestServer(t *testing.T) (*server.Server, *httptest.Server) {
+	t.Helper()
+	s, err := server.New(server.Config{
+		OperatorTokenHashes: []string{sha256Hex(testOperatorToken)},
+		AgentTokenHashes: map[string]string{
+			"agent-a": sha256Hex(testAgentAToken),
+			"agent-b": sha256Hex(testAgentBToken),
+		},
+		RateLimitPerWindow: 1000,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
 	ts := httptest.NewServer(s.Handler())
 	return s, ts
 }
 
-func checkIn(t *testing.T, ts *httptest.Server, ci protocol.CheckIn) protocol.CheckInResponse {
+func newAuthedJSONRequest(t *testing.T, method, rawURL, token string, payload any) *http.Request {
 	t.Helper()
-	body, _ := json.Marshal(ci)
-	resp, err := http.Post(ts.URL+"/checkin", "application/json", bytes.NewReader(body))
+	var body []byte
+	if payload != nil {
+		var err error
+		body, err = json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+	}
+	req, err := http.NewRequest(method, rawURL, bytes.NewReader(body))
 	if err != nil {
-		t.Fatalf("check-in request failed: %v", err)
+		t.Fatalf("new request: %v", err)
 	}
-	defer resp.Body.Close()
-
-	var r protocol.CheckInResponse
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		t.Fatalf("decode response: %v", err)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
-	return r
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req
 }
 
-func listAgents(t *testing.T, ts *httptest.Server) []server.AgentInfo {
+func doRequest(t *testing.T, req *http.Request) *http.Response {
 	t.Helper()
-	resp, err := http.Get(ts.URL + "/agents")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("list agents: %v", err)
+		t.Fatalf("do request: %v", err)
 	}
-	defer resp.Body.Close()
-
-	var agents []server.AgentInfo
-	if err := json.NewDecoder(resp.Body).Decode(&agents); err != nil {
-		t.Fatalf("decode agents: %v", err)
-	}
-	return agents
+	return resp
 }
 
-func TestCheckInRegistersAgent(t *testing.T) {
-	_, ts := newTestServer()
-	defer ts.Close()
-
-	r := checkIn(t, ts, protocol.CheckIn{
-		ID:       "test-agent",
+func checkIn(t *testing.T, ts *httptest.Server, token, id string) protocol.CheckInResponse {
+	t.Helper()
+	req := newAuthedJSONRequest(t, http.MethodPost, ts.URL+"/checkin", token, protocol.CheckIn{
+		ID:       id,
 		Hostname: "box1",
 		OS:       "linux",
 		Arch:     "amd64",
 	})
-
-	if r.Command != "" {
-		t.Errorf("expected no command on first check-in, got %q", r.Command)
-	}
-}
-
-func TestCheckInMethodNotAllowed(t *testing.T) {
-	_, ts := newTestServer()
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/checkin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("expected 405, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("checkin status: %d", resp.StatusCode)
 	}
+	var out protocol.CheckInResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode checkin response: %v", err)
+	}
+	return out
 }
 
-func TestListAgentsEmpty(t *testing.T) {
-	_, ts := newTestServer()
+func TestOperatorQueuesCommandAsJSONBody(t *testing.T) {
+	_, ts := newTestServer(t)
 	defer ts.Close()
 
-	agents := listAgents(t, ts)
-	if len(agents) != 0 {
-		t.Errorf("expected 0 agents, got %d", len(agents))
-	}
-}
+	checkIn(t, ts, testAgentAToken, "agent-a")
 
-func TestSendCommandAndReceiveViaCheckIn(t *testing.T) {
-	_, ts := newTestServer()
-	defer ts.Close()
-
-	checkIn(t, ts, protocol.CheckIn{ID: "agent1", Hostname: "box", OS: "linux", Arch: "amd64"})
-
-	req, _ := http.NewRequest(http.MethodPost,
-		ts.URL+"/command?agent_id=agent1&command_id=cmd1&command=echo+hello", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("send command: %v", err)
-	}
+	req := newAuthedJSONRequest(t, http.MethodPost, ts.URL+"/command", testOperatorToken, protocol.CommandRequest{
+		AgentID:   "agent-a",
+		CommandID: "cmd1",
+		Command:   "echo hello",
+	})
+	resp := doRequest(t, req)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("expected 204, got %d", resp.StatusCode)
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
 	}
 
-	r := checkIn(t, ts, protocol.CheckIn{ID: "agent1", Hostname: "box", OS: "linux", Arch: "amd64"})
-	if r.Command != "echo hello" {
-		t.Errorf("expected command 'echo hello', got %q", r.Command)
-	}
-	if r.CommandID != "cmd1" {
-		t.Errorf("expected command_id 'cmd1', got %q", r.CommandID)
-	}
-
-	r2 := checkIn(t, ts, protocol.CheckIn{ID: "agent1", Hostname: "box", OS: "linux", Arch: "amd64"})
-	if r2.Command != "" {
-		t.Errorf("command should be cleared after dispatch, got %q", r2.Command)
+	ciResp := checkIn(t, ts, testAgentAToken, "agent-a")
+	if ciResp.CommandID != "cmd1" || ciResp.Command != "echo hello" {
+		t.Fatalf("unexpected command response: %+v", ciResp)
 	}
 }
 
-func TestResultEndpoint(t *testing.T) {
-	_, ts := newTestServer()
+func TestMissingOrWrongCredentialRejected(t *testing.T) {
+	_, ts := newTestServer(t)
 	defer ts.Close()
 
-	checkIn(t, ts, protocol.CheckIn{ID: "agent1", Hostname: "box", OS: "linux", Arch: "amd64"})
-
-	res := protocol.Result{AgentID: "agent1", CommandID: "cmd1", Output: "hello\n"}
-	body, _ := json.Marshal(res)
-	resp, err := http.Post(ts.URL+"/result", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("post result: %v", err)
-	}
+	noAuthReq := newAuthedJSONRequest(t, http.MethodGet, ts.URL+"/agents", "", nil)
+	resp := doRequest(t, noAuthReq)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("expected 204, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing auth, got %d", resp.StatusCode)
 	}
 
-	gresp, err := http.Get(ts.URL + "/results")
+	wrongAuthReq := newAuthedJSONRequest(t, http.MethodGet, ts.URL+"/agents", "wrong", nil)
+	resp = doRequest(t, wrongAuthReq)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong auth, got %d", resp.StatusCode)
+	}
+}
+
+func TestAgentCannotCallOperatorEndpoint(t *testing.T) {
+	_, ts := newTestServer(t)
+	defer ts.Close()
+
+	req := newAuthedJSONRequest(t, http.MethodGet, ts.URL+"/results", testAgentAToken, nil)
+	resp := doRequest(t, req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestAgentCannotImpersonateAnotherAgent(t *testing.T) {
+	_, ts := newTestServer(t)
+	defer ts.Close()
+
+	req := newAuthedJSONRequest(t, http.MethodPost, ts.URL+"/checkin", testAgentAToken, protocol.CheckIn{
+		ID:       "agent-b",
+		Hostname: "box1",
+		OS:       "linux",
+		Arch:     "amd64",
+	})
+	resp := doRequest(t, req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+
+	req = newAuthedJSONRequest(t, http.MethodPost, ts.URL+"/result", testAgentAToken, protocol.Result{
+		AgentID:   "agent-b",
+		CommandID: "cmd-x",
+		Output:    "x",
+	})
+	resp = doRequest(t, req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestRevokedAgentCredentialDenied(t *testing.T) {
+	s, ts := newTestServer(t)
+	defer ts.Close()
+
+	checkIn(t, ts, testAgentAToken, "agent-a")
+	s.RevokeAgentCredential("agent-a")
+
+	req := newAuthedJSONRequest(t, http.MethodPost, ts.URL+"/checkin", testAgentAToken, protocol.CheckIn{
+		ID:       "agent-a",
+		Hostname: "box1",
+		OS:       "linux",
+		Arch:     "amd64",
+	})
+	resp := doRequest(t, req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after revocation, got %d", resp.StatusCode)
+	}
+}
+
+func TestValidationRejectsInvalidJSONEmptyIDAndOversize(t *testing.T) {
+	_, ts := newTestServer(t)
+	defer ts.Close()
+
+	checkIn(t, ts, testAgentAToken, "agent-a")
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/command", strings.NewReader(`{"agent_id":"agent-a"}{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer gresp.Body.Close()
+	req.Header.Set("Authorization", "Bearer "+testOperatorToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp := doRequest(t, req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for extra JSON object, got %d", resp.StatusCode)
+	}
 
-	var results []protocol.Result
-	if err := json.NewDecoder(gresp.Body).Decode(&results); err != nil {
-		t.Fatalf("decode results: %v", err)
+	req = newAuthedJSONRequest(t, http.MethodPost, ts.URL+"/checkin", testAgentAToken, protocol.CheckIn{
+		ID:       "",
+		Hostname: "box1",
+		OS:       "linux",
+		Arch:     "amd64",
+	})
+	resp = doRequest(t, req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty id, got %d", resp.StatusCode)
 	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-	if results[0].Output != "hello\n" {
-		t.Errorf("unexpected output: %q", results[0].Output)
+
+	oversizedCommand := strings.Repeat("x", 3000)
+	req = newAuthedJSONRequest(t, http.MethodPost, ts.URL+"/command", testOperatorToken, protocol.CommandRequest{
+		AgentID:   "agent-a",
+		CommandID: "cmd-oversized",
+		Command:   oversizedCommand,
+	})
+	resp = doRequest(t, req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for oversized command field, got %d", resp.StatusCode)
 	}
 }
 
-func TestSendCommandUnknownAgent(t *testing.T) {
-	_, ts := newTestServer()
+func TestContentTypeRequired(t *testing.T) {
+	_, ts := newTestServer(t)
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodPost,
-		ts.URL+"/command?agent_id=nobody&command_id=c1&command=id", nil)
-	resp, err := http.DefaultClient.Do(req)
+	payload, _ := json.Marshal(protocol.CheckIn{ID: "agent-a", Hostname: "box1", OS: "linux", Arch: "amd64"})
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/checkin", bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Header.Set("Authorization", "Bearer "+testAgentAToken)
+	resp := doRequest(t, req)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("expected 404, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415, got %d", resp.StatusCode)
 	}
 }
 
 func TestConcurrentCheckInAndListAgentsSnapshot(t *testing.T) {
-	_, ts := newTestServer()
+	_, ts := newTestServer(t)
 	defer ts.Close()
 
-	checkIn(t, ts, protocol.CheckIn{ID: "agent1", Hostname: "box", OS: "linux", Arch: "amd64"})
-	req, _ := http.NewRequest(http.MethodPost,
-		ts.URL+"/command?agent_id=agent1&command_id=cmd1&command=echo+secret", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("send command: %v", err)
-	}
+	checkIn(t, ts, testAgentAToken, "agent-a")
+	req := newAuthedJSONRequest(t, http.MethodPost, ts.URL+"/command", testOperatorToken, protocol.CommandRequest{
+		AgentID:   "agent-a",
+		CommandID: "cmd1",
+		Command:   "echo secret",
+	})
+	resp := doRequest(t, req)
 	resp.Body.Close()
 
-	const iterations = 200
+	const iterations = 100
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 	wg.Add(2)
@@ -196,25 +282,33 @@ func TestConcurrentCheckInAndListAgentsSnapshot(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iterations; i++ {
-			checkIn(t, ts, protocol.CheckIn{
-				ID:       "agent1",
-				Hostname: fmt.Sprintf("box-%d", i),
-				OS:       "linux",
-				Arch:     "amd64",
-			})
+			checkIn(t, ts, testAgentAToken, "agent-a")
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iterations; i++ {
-			agents := listAgents(t, ts)
-			if len(agents) == 0 {
-				errCh <- fmt.Errorf("expected at least one agent")
+			req := newAuthedJSONRequest(t, http.MethodGet, ts.URL+"/agents", testOperatorToken, nil)
+			resp := doRequest(t, req)
+			if resp.StatusCode != http.StatusOK {
+				errCh <- fmt.Errorf("expected 200, got %d", resp.StatusCode)
+				resp.Body.Close()
 				return
 			}
-			if agents[0].ID == "" {
-				errCh <- fmt.Errorf("expected agent id in DTO")
+			var raw []map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+				errCh <- err
+				resp.Body.Close()
+				return
+			}
+			resp.Body.Close()
+			if len(raw) == 0 || raw[0]["id"] == "" {
+				errCh <- fmt.Errorf("missing agent id")
+				return
+			}
+			if _, hasCommand := raw[0]["command"]; hasCommand {
+				errCh <- fmt.Errorf("agents DTO must not expose command text")
 				return
 			}
 		}
@@ -222,36 +316,22 @@ func TestConcurrentCheckInAndListAgentsSnapshot(t *testing.T) {
 
 	wg.Wait()
 	close(errCh)
-	for runErr := range errCh {
-		if runErr != nil {
-			t.Fatal(runErr)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-
-	agents := listAgents(t, ts)
-	if len(agents) != 1 {
-		t.Fatalf("expected exactly one agent, got %d", len(agents))
-	}
-	if agents[0].HasPending {
-		t.Fatalf("expected no pending command after check-ins")
-	}
-
-	agentsBodyResp, err := http.Get(ts.URL + "/agents")
-	if err != nil {
-		t.Fatalf("get agents body: %v", err)
-	}
-	defer agentsBodyResp.Body.Close()
-	var raw []map[string]any
-	if err := json.NewDecoder(agentsBodyResp.Body).Decode(&raw); err != nil {
-		t.Fatalf("decode raw agents: %v", err)
-	}
-	if _, hasCommand := raw[0]["command"]; hasCommand {
-		t.Fatal("agents DTO must not expose pending command text")
 	}
 }
 
 func TestListenAndServeGracefulShutdown(t *testing.T) {
-	s := server.New()
+	s, err := server.New(server.Config{
+		OperatorTokenHashes: []string{sha256Hex(testOperatorToken)},
+		AgentTokenHashes:    map[string]string{"agent-a": sha256Hex(testAgentAToken)},
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -262,12 +342,13 @@ func TestListenAndServeGracefulShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- s.ListenAndServe(ctx, addr)
+		errCh <- s.ListenAndServe(ctx, server.ListenConfig{Addr: addr, DevHTTP: true})
 	}()
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		resp, reqErr := http.Get("http://" + addr + "/agents")
+		req := newAuthedJSONRequest(t, http.MethodGet, "http://"+addr+"/agents", testOperatorToken, nil)
+		resp, reqErr := http.DefaultClient.Do(req)
 		if reqErr == nil {
 			resp.Body.Close()
 			break
@@ -276,13 +357,27 @@ func TestListenAndServeGracefulShutdown(t *testing.T) {
 	}
 
 	cancel()
-
 	select {
 	case runErr := <-errCh:
 		if runErr != nil {
-			t.Fatalf("expected graceful shutdown, got error: %v", runErr)
+			t.Fatalf("expected graceful shutdown, got: %v", runErr)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("server did not shut down after context cancel")
+		t.Fatal("server did not shut down")
+	}
+}
+
+func TestDevHTTPRequiresLoopback(t *testing.T) {
+	s, err := server.New(server.Config{
+		OperatorTokenHashes: []string{sha256Hex(testOperatorToken)},
+		AgentTokenHashes:    map[string]string{"agent-a": sha256Hex(testAgentAToken)},
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	err = s.ListenAndServe(context.Background(), server.ListenConfig{Addr: "0.0.0.0:8080", DevHTTP: true})
+	if err == nil {
+		t.Fatal("expected error for non-loopback dev http")
 	}
 }

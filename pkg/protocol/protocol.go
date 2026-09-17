@@ -17,6 +17,13 @@ type CheckInResponse struct {
 	Command   string `json:"command,omitempty"`
 }
 
+// CommandRequest is sent by the operator to queue a command for an agent.
+type CommandRequest struct {
+	AgentID   string `json:"agent_id"`
+	CommandID string `json:"command_id"`
+	Command   string `json:"command"`
+}
+
 // Result is sent by an agent after executing a command.
 type Result struct {
 	AgentID   string `json:"agent_id"`
