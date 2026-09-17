@@ -174,15 +174,10 @@ func TestNewValidation(t *testing.T) {
 }
 
 func TestTLSWrongCertificateFails(t *testing.T) {
-	serverA := httptest.NewTLSServer(&fakeServer{requiredAuth: testCredential})
-	defer serverA.Close()
+	server := httptest.NewTLSServer(&fakeServer{requiredAuth: testCredential})
+	defer server.Close()
 
-	serverB := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer serverB.Close()
-
-	cert := serverB.Certificate()
+	cert := server.Certificate()
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
 	caFile, err := os.CreateTemp(t.TempDir(), "ca-*.pem")
 	if err != nil {
@@ -195,9 +190,10 @@ func TestTLSWrongCertificateFails(t *testing.T) {
 		t.Fatalf("close ca file: %v", err)
 	}
 
-	a, err := agent.New("test-agent", "myhost", serverA.URL, time.Hour, agent.Options{
-		Credential: testCredential,
-		CACertFile: caFile.Name(),
+	a, err := agent.New("test-agent", "myhost", server.URL, time.Hour, agent.Options{
+		Credential:    testCredential,
+		CACertFile:    caFile.Name(),
+		TLSServerName: "wrong-server-name.local",
 	})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
